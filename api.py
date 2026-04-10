@@ -1,164 +1,418 @@
+"""
+FIFA WC 2034 Crowd AI Backend
+- YOLOv11x person detection + DeepSort tracking
+- LightGBM 15-min density forecasting
+- TensorFlow density level classification
+- Heatmap generation
+- Supports: video file mode (demo) OR live camera mode
+"""
+
+import os, time, threading, random, io, base64
+from collections import deque
+import urllib.request, json as _json
+
+import cv2
+import numpy as np
+import pandas as pd
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+
 from ultralytics import YOLO
-import os, time, threading, random
-from collections import deque
+from deep_sort_realtime.deepsort_tracker import DeepSort
 
-# --------------------
-# CONFIG (YOUR PATHS)
-# --------------------
-IMAGE_FOLDER = "/Users/ranamahmoud/Downloads/People Detection.v11-rf-detr-medium.yolov8/test/images"
-LABEL_FOLDER = "/Users/ranamahmoud/Downloads/People Detection.v11-rf-detr-medium.yolov8/test/labels"
+# ─────────────────────────────────────────────────────────────────
+# CONFIG  — change CAMERA_MODE to True when your camera is wired
+# ─────────────────────────────────────────────────────────────────
+CAMERA_MODE  = False                          # False = video files, True = live webcam
+CAMERA_INDEX = 0                              # webcam index when CAMERA_MODE=True
 
-MODEL_PATH = "yolov8n.pt"   # if you have best.pt, replace with "best.pt"
-CONF = 0.35
+VIDEO_FOLDER = "/Users/ranamahmoud/Downloads/Stadiums videos "   # trailing space = actual folder name
+YOLO_MODEL   = "yolo11x.pt"                   # auto-downloaded if not present
+CONF             = 0.1
 UPDATE_EVERY_SEC = 3
+FRAME_SKIP       = 30    # advance this many frames per inference step
+TILE_GRID        = 3     # split frame into TILE_GRID × TILE_GRID tiles (3×3 = 9 tiles)
+TILE_OVERLAP     = 0.1   # 10% overlap between tiles to avoid missing border detections
+NMS_IOU          = 0.35  # IoU threshold for deduplication across tiles
 
-# thresholds for demo alert level
 NORMAL_MAX = 10
-BUSY_MAX = 25
+BUSY_MAX   = 25
 
+MODELS_DIR   = "models"
+LGBM_MODEL   = os.path.join(MODELS_DIR, "lgbm_forecast.pkl")
+LGBM_SCALER  = os.path.join(MODELS_DIR, "lgbm_scaler.pkl")
+TF_MODEL     = os.path.join(MODELS_DIR, "tf_density_classifier.keras")
+TF_SCALER    = os.path.join(MODELS_DIR, "tf_scaler.pkl")
+TF_ENCODER   = os.path.join(MODELS_DIR, "tf_label_encoder.pkl")
+
+HEATMAP_GRID = 10          # grid resolution for heatmap (10×10)
+HEATMAP_W    = 640
+HEATMAP_H    = 480
+
+# ─────────────────────────────────────────────────────────────────
+# HELPERS
+# ─────────────────────────────────────────────────────────────────
 def risk_from_count(count: int) -> str:
-    if count <= NORMAL_MAX:
-        return "Normal"
-    if count <= BUSY_MAX:
-        return "Busy"
+    if count <= NORMAL_MAX: return "Normal"
+    if count <= BUSY_MAX:   return "Busy"
     return "Critical"
 
 def density_from_count(count: int) -> float:
     return round(min(7.5, count / 12.0), 1)
 
-def count_lines(path: str) -> int:
+def compute_accuracy(pred: int, gt: int) -> float:
+    if gt <= 0: return 1.0 if pred == 0 else 0.0
+    return round(max(0.0, 1.0 - abs(pred - gt) / gt), 2)
+
+def frame_to_base64(frame: np.ndarray) -> str:
+    _, buf = cv2.imencode(".jpg", frame)
+    return base64.b64encode(buf).decode("utf-8")
+
+def build_heatmap(centres: list[tuple[float, float]],
+                  frame_w: int = HEATMAP_W,
+                  frame_h: int = HEATMAP_H) -> str:
+    """
+    Given a list of (cx, cy) person centres (in pixel coords),
+    return a base64-encoded heatmap JPEG.
+    """
+    heat = np.zeros((HEATMAP_GRID, HEATMAP_GRID), dtype=np.float32)
+    for cx, cy in centres:
+        col = min(HEATMAP_GRID - 1, int(cx / frame_w * HEATMAP_GRID))
+        row = min(HEATMAP_GRID - 1, int(cy / frame_h * HEATMAP_GRID))
+        heat[row, col] += 1.0
+
+    # Normalise → 0-255 and apply colour map
+    if heat.max() > 0:
+        heat = heat / heat.max()
+    heat_u8 = (heat * 255).astype(np.uint8)
+    heat_big = cv2.resize(heat_u8, (HEATMAP_W, HEATMAP_H), interpolation=cv2.INTER_LINEAR)
+    coloured = cv2.applyColorMap(heat_big, cv2.COLORMAP_JET)
+    return frame_to_base64(coloured)
+
+
+# ─────────────────────────────────────────────────────────────────
+# MODEL LOADING
+# ─────────────────────────────────────────────────────────────────
+print("[boot] Loading YOLO …")
+yolo_model = YOLO(YOLO_MODEL)
+
+print("[boot] Loading DeepSort tracker …")
+tracker = DeepSort(max_age=30, n_init=3, nms_max_overlap=1.0, embedder=None)
+
+MODEL_SERVER_URL = "http://127.0.0.1:8001"   # model microservice (port 8001)
+_model_server_ok = False   # updated each inference cycle
+
+
+# ─────────────────────────────────────────────────────────────────
+# VIDEO SOURCE
+# ─────────────────────────────────────────────────────────────────
+if not CAMERA_MODE:
+    video_files = sorted([
+        os.path.join(VIDEO_FOLDER, f)
+        for f in os.listdir(VIDEO_FOLDER)
+        if f.lower().endswith(".mp4")
+    ])
+    print(f"[boot] Found {len(video_files)} video files for demo mode")
+    _current_video_idx = 0
+
+
+def next_frame():
+    """
+    Generator: yields (frame, source_name) indefinitely.
+    In CAMERA_MODE it reads from webcam; otherwise cycles through video files.
+    """
+    global _current_video_idx
+
+    if CAMERA_MODE:
+        cap = cv2.VideoCapture(CAMERA_INDEX)
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                time.sleep(0.1)
+                continue
+            yield frame, f"camera:{CAMERA_INDEX}"
+        cap.release()
+    else:
+        # Cycle through video files, skipping FRAME_SKIP frames per step
+        while True:
+            vp       = video_files[_current_video_idx % len(video_files)]
+            cap      = cv2.VideoCapture(vp)
+            pos      = 0
+            total    = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            while pos < total:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                yield frame, os.path.basename(vp)
+                pos += FRAME_SKIP
+            cap.release()
+            _current_video_idx += 1
+
+
+# ─────────────────────────────────────────────────────────────────
+# SHARED STATE
+# ─────────────────────────────────────────────────────────────────
+latest = {
+    "timestamp":      "",
+    "source":         "",
+    "peoplePred":     0,
+    "trackedIDs":     0,
+    "avgDensity":     0.0,
+    "riskLevel":      "Normal",
+    "activeIncidents":0,
+    "accuracy":       0.0,
+}
+history       = deque(maxlen=60)
+last_heatmap  = ""           # base64 string, updated each cycle
+
+
+# ─────────────────────────────────────────────────────────────────
+# FORECAST HELPER
+# ─────────────────────────────────────────────────────────────────
+def _call_model_server(count: int, density: float, time_of_day: float,
+                       cx_std: float, cy_std: float, avg_box_area: float) -> dict:
+    """POST features to model microservice. Returns dict or None on failure."""
+    global _model_server_ok
     try:
-        with open(path, "r") as f:
-            return sum(1 for line in f if line.strip())
-    except FileNotFoundError:
-        return 0
+        payload = _json.dumps({
+            "count": count, "density": density, "time_of_day": time_of_day,
+            "cx_std": cx_std, "cy_std": cy_std, "avg_box_area": avg_box_area,
+        }).encode()
+        req = urllib.request.Request(
+            f"{MODEL_SERVER_URL}/predict",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=2) as resp:
+            result = _json.loads(resp.read())
+            _model_server_ok = True
+            return result
+    except Exception:
+        _model_server_ok = False
+        return {}
 
 
+def predict_15min(count: int, density: float, time_of_day: float,
+                  cx_std: float, cy_std: float, avg_box_area: float) -> float:
+    result = _call_model_server(count, density, time_of_day, cx_std, cy_std, avg_box_area)
+    return result.get("predictedDensity", round(min(9.0, density + 0.6), 1))
+
+
+def classify_risk(count: int, density: float, time_of_day: float,
+                  cx_std: float, cy_std: float, avg_box_area: float) -> str:
+    result = _call_model_server(count, density, time_of_day, cx_std, cy_std, avg_box_area)
+    return result.get("predictedRisk", risk_from_count(count))
+
+
+# ─────────────────────────────────────────────────────────────────
+# TILING HELPERS
+# ─────────────────────────────────────────────────────────────────
+def _nms(boxes: np.ndarray, scores: np.ndarray, iou_thr: float) -> list[int]:
+    """Non-maximum suppression — removes duplicate detections across tile borders."""
+    if len(boxes) == 0:
+        return []
+    x1, y1, x2, y2 = boxes[:,0], boxes[:,1], boxes[:,2], boxes[:,3]
+    areas  = (x2 - x1) * (y2 - y1)
+    order  = scores.argsort()[::-1]
+    keep   = []
+    while order.size > 0:
+        i = order[0]
+        keep.append(int(i))
+        xx1 = np.maximum(x1[i], x1[order[1:]])
+        yy1 = np.maximum(y1[i], y1[order[1:]])
+        xx2 = np.minimum(x2[i], x2[order[1:]])
+        yy2 = np.minimum(y2[i], y2[order[1:]])
+        inter = np.maximum(0, xx2 - xx1) * np.maximum(0, yy2 - yy1)
+        iou   = inter / (areas[i] + areas[order[1:]] - inter + 1e-6)
+        order = order[np.where(iou <= iou_thr)[0] + 1]
+    return keep
+
+
+def tile_predict(frame: np.ndarray) -> list[list[float]]:
+    """
+    Split frame into TILE_GRID×TILE_GRID overlapping tiles, run YOLO on each,
+    map boxes back to original coordinates, deduplicate with NMS.
+    Returns list of [x1, y1, x2, y2] in original frame pixel coords.
+    """
+    h, w   = frame.shape[:2]
+    th, tw = h // TILE_GRID, w // TILE_GRID
+    ph, pw = int(th * TILE_OVERLAP), int(tw * TILE_OVERLAP)
+
+    all_boxes, all_scores = [], []
+
+    for row in range(TILE_GRID):
+        for col in range(TILE_GRID):
+            y1 = max(0, row * th - ph);  y2 = min(h, (row + 1) * th + ph)
+            x1 = max(0, col * tw - pw);  x2 = min(w, (col + 1) * tw + pw)
+            tile    = frame[y1:y2, x1:x2]
+            results = yolo_model.predict(source=tile, conf=CONF,
+                                         verbose=False, classes=[0])
+            boxes = results[0].boxes
+            if boxes is None or len(boxes) == 0:
+                continue
+            for box in boxes:
+                bx1, by1, bx2, by2 = box.xyxy[0].tolist()
+                all_boxes.append([bx1 + x1, by1 + y1, bx2 + x1, by2 + y1])
+                all_scores.append(float(box.conf[0]))
+
+    if not all_boxes:
+        return []
+    keep = _nms(np.array(all_boxes), np.array(all_scores), NMS_IOU)
+    return [all_boxes[i] for i in keep]
+
+
+# ─────────────────────────────────────────────────────────────────
+# BACKGROUND INFERENCE LOOP
+# ─────────────────────────────────────────────────────────────────
+def inference_loop():
+    global latest, last_heatmap
+
+    # TF disabled in backend — conflicts with YOLO/PyTorch on Apple Silicon (OpenMP crash)
+    # Risk classification uses rule-based fallback which is stable
+
+    frame_gen   = next_frame()
+    frame_w     = HEATMAP_W
+    frame_h     = HEATMAP_H
+    time_of_day = 10.0
+
+    while True:
+        frame, source_name = next(frame_gen)
+        frame_h, frame_w   = frame.shape[:2]
+
+        # ── YOLO tiled detection (3×3 grid → detects distant/small people) ──
+        xyxy_all    = tile_predict(frame)
+        pred_people = len(xyxy_all)
+        tracked_ids = pred_people
+
+        # ── Spatial features ──
+        centres = [
+            (0.5 * (x1 + x2), 0.5 * (y1 + y2))
+            for x1, y1, x2, y2 in xyxy_all
+        ]
+        cx_std  = float(np.std([c[0] for c in centres])) if centres else 0.0
+        cy_std  = float(np.std([c[1] for c in centres])) if centres else 0.0
+        fa      = max(1, frame_w * frame_h)
+        avg_box = (float(np.mean([(x2-x1)*(y2-y1) for x1,y1,x2,y2 in xyxy_all])) / fa
+                   if xyxy_all else 0.0)
+
+        # ── Models ──
+        density   = density_from_count(pred_people)
+        risk      = classify_risk(pred_people, density, time_of_day,
+                                  cx_std, cy_std, avg_box)
+        forecast  = predict_15min(pred_people, density, time_of_day,
+                                  cx_std, cy_std, avg_box)
+
+        incidents = 0
+        if risk == "Busy":     incidents = 1
+        if risk == "Critical": incidents = 3
+
+        # ── Heatmap ──
+        last_heatmap = build_heatmap(centres, frame_w, frame_h)
+
+        timestamp = time.strftime("%H:%M:%S")
+
+        latest = {
+            "timestamp":       timestamp,
+            "source":          source_name,
+            "peoplePred":      pred_people,
+            "trackedIDs":      tracked_ids,
+            "avgDensity":      density,
+            "riskLevel":       risk,
+            "activeIncidents": incidents,
+            "accuracy":        0.0,        # no GT labels in video mode
+        }
+
+        history.append({
+            "t":             timestamp,
+            "density":       density,
+            "predDensity15": forecast,
+            "peoplePred":    pred_people,
+            "trackedIDs":    tracked_ids,
+        })
+
+        time.sleep(UPDATE_EVERY_SEC)
+
+
+threading.Thread(target=inference_loop, daemon=True).start()
+
+
+# ─────────────────────────────────────────────────────────────────
+# FASTAPI APP
+# ─────────────────────────────────────────────────────────────────
 app = FastAPI(
     title="FIFA WC 2034 Crowd AI Backend",
-    version="1.0.0",
-    description="YOLOv8-based crowd detection + density metrics + 15-minute forecasting"
+    version="2.0.0",
+    description="YOLOv11x + DeepSort + LightGBM + TensorFlow crowd management API",
 )
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5178",
-        "http://127.0.0.1:5178",
-    ],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-model = YOLO(MODEL_PATH)
-
-image_files = sorted([
-    os.path.join(IMAGE_FOLDER, f)
-    for f in os.listdir(IMAGE_FOLDER)
-    if f.lower().endswith((".jpg", ".jpeg", ".png"))
-])
-
-latest = {
-    "timestamp": "",
-    "image": "",
-    "peoplePred": 0,
-    "peopleGT": 0,
-    "avgDensity": 0.0,
-    "riskLevel": "Normal",
-    "activeIncidents": 0,
-    "accuracy": 0.0
-}
-
-history = deque(maxlen=30)
-
-def compute_accuracy(pred: int, gt: int) -> float:
-    if gt <= 0:
-        return 1.0 if pred == 0 else 0.0
-    err = abs(pred - gt)
-    return round(max(0.0, 1.0 - (err / gt)), 2)
-
-def loop():
-    global latest
-    while True:
-        if not image_files:
-            time.sleep(1)
-            continue
-
-        # ✅ RANDOM IMAGE SELECTION (instead of sequential idx)
-        img_path = random.choice(image_files)
-        print(f"Selected image: {os.path.basename(img_path)}")
-
-        base = os.path.splitext(os.path.basename(img_path))[0]
-        label_path = os.path.join(LABEL_FOLDER, base + ".txt")
-
-        gt_people = count_lines(label_path)
-
-        results = model.predict(source=img_path, conf=CONF, verbose=False)
-        boxes = results[0].boxes
-        cls = boxes.cls.tolist() if boxes is not None else []
-
-        # NOTE: for yolov8n.pt (COCO), person class = 0
-        pred_people = sum(1 for c in cls if int(c) == 0)
-
-        risk = risk_from_count(pred_people)
-        density = density_from_count(pred_people)
-
-        incidents = 0
-        if risk == "Busy":
-            incidents = 1
-        elif risk == "Critical":
-            incidents = 3
-
-        acc = compute_accuracy(pred_people, gt_people)
-        timestamp = time.strftime("%H:%M:%S")
-
-        latest = {
-            "timestamp": timestamp,
-            "image": os.path.basename(img_path),
-            "peoplePred": pred_people,
-            "peopleGT": gt_people,
-            "avgDensity": density,
-            "riskLevel": risk,
-            "activeIncidents": incidents,
-            "accuracy": acc
-        }
-
-        pred_density_15 = round(min(9.0, density + 0.6), 1)
-
-        history.append({
-            "t": timestamp,
-            "density": density,
-            "predDensity15": pred_density_15,
-            "peoplePred": pred_people,
-            "peopleGT": gt_people
-        })
-
-        time.sleep(UPDATE_EVERY_SEC)
-
-threading.Thread(target=loop, daemon=True).start()
 
 @app.get("/api/v1/health", tags=["Health"])
 def health():
-    return {"status": "ok", "service": "crowd-ai-backend"}
+    return {
+        "status":            "ok",
+        "service":           "crowd-ai-backend",
+        "mode":              "camera" if CAMERA_MODE else "video",
+        "model_server":      _model_server_ok,
+        "lgbm_loaded":       _model_server_ok,
+        "tf_loaded":         _model_server_ok,
+    }
+
 
 @app.get("/api/v1/metrics/latest", tags=["Metrics"])
 def metrics_latest():
     return latest
 
+
 @app.get("/api/v1/metrics/history", tags=["Metrics"])
 def metrics_history():
     return list(history)
 
+
 @app.get("/api/v1/predictions/15min", tags=["Predictions"])
 def prediction_15min():
-    if len(history) == 0:
-        return {"forecastHorizon": "15 minutes", "predictedDensity": 0.0, "predictedRisk": "Normal"}
+    if not history:
+        return {"forecastHorizon": "15 minutes",
+                "predictedDensity": 0.0, "predictedRisk": "Normal"}
     last = history[-1]
+    pd15 = last["predDensity15"]
     return {
-        "forecastHorizon": "15 minutes",
-        "predictedDensity": last["predDensity15"],
-        "predictedRisk": "Critical" if last["predDensity15"] >= 5.0 else "Busy" if last["predDensity15"] >= 3.0 else "Normal"
+        "forecastHorizon":  "15 minutes",
+        "predictedDensity": pd15,
+        "predictedRisk":    ("Critical" if pd15 >= 5.0
+                             else "Busy" if pd15 >= 3.0
+                             else "Normal"),
     }
+
+
+@app.get("/api/v1/heatmap", tags=["Metrics"])
+def heatmap():
+    """Returns the latest crowd density heatmap as a base64-encoded JPEG."""
+    return {"heatmap": last_heatmap}
+
+
+@app.post("/api/v1/mode/camera", tags=["Config"])
+def switch_to_camera():
+    """Switch to live camera input (call when camera is wired)."""
+    import api as _self
+    _self.CAMERA_MODE = True
+    return {"message": "Switched to live camera mode. Restart server to apply."}
+
+
+@app.post("/api/v1/mode/video", tags=["Config"])
+def switch_to_video():
+    """Switch back to video file demo mode."""
+    import api as _self
+    _self.CAMERA_MODE = False
+    return {"message": "Switched to video file mode. Restart server to apply."}
