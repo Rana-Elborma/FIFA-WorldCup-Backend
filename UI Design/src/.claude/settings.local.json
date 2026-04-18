@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/Rimas Alghamdi/Projects/Senior Project/crowd_app/**)",
+      "Bash(flutter pub:*)",
+      "Bash(flutter.bat pub:*)",
+      "Bash(\"$LOCALAPPDATA/flutter/bin/flutter\" pub:*)",
+      "Bash(powershell.exe -Command \"flutter pub get\")"
+    ]
+  }
+}
