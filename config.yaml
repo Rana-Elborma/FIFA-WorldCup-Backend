@@ -1,0 +1,41 @@
+# ─────────────────────────────────────────────────────────────────
+# FIFA WC 2034  —  Crowd AI Backend Configuration
+# Change "source" to switch camera input — no code rewrite needed.
+# ─────────────────────────────────────────────────────────────────
+
+# Camera source: "video" | "webcam" | "rtsp"
+source: video
+
+video:
+  folder: "/Users/ranamahmoud/Downloads/Stadiums videos "   # trailing space = actual folder name
+  frame_skip: 30          # advance N frames per inference step
+
+webcam:
+  index: 0                # USB webcam index (0 = first camera)
+
+rtsp:
+  url: "rtsp://admin:password@192.168.1.100:554/stream1"    # NVR/DVR stream URL
+  reconnect_delay: 5      # seconds to wait before reconnecting on drop
+
+yolo:
+  model: "yolo11x.pt"     # model file (auto-downloaded if missing)
+  conf: 0.10              # detection confidence threshold
+  tile_grid: 3            # NxN tiling (3 = 3x3 = 9 tiles per frame)
+  tile_overlap: 0.10      # overlap fraction between tiles
+  nms_iou: 0.35           # IoU threshold for cross-tile deduplication
+
+inference:
+  update_every_sec: 3     # seconds between inference cycles
+
+thresholds:
+  normal_max: 10          # count <= this → Normal
+  busy_max: 25            # count <= this → Busy, else Critical
+
+heatmap:
+  grid: 10                # NxN grid resolution
+  width: 640
+  height: 480
+
+models:
+  dir: "models"
+  server_url: "http://127.0.0.1:8001"
