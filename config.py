@@ -17,8 +17,10 @@ VIDEO_FRAME_SKIP = int(_cfg["video"].get("frame_skip", 30))
 
 WEBCAM_INDEX     = int(_cfg["webcam"].get("index", 0))
 
-RTSP_URL              = _cfg["rtsp"].get("url", "")
+RTSP_URL              = os.environ.get("CAMERA_RTSP_URL") or _cfg["rtsp"].get("url", "")
 RTSP_RECONNECT_DELAY  = int(_cfg["rtsp"].get("reconnect_delay", 5))
+RTSP_TRANSPORT        = _cfg["rtsp"].get("transport", "tcp")
+RTSP_FRAME_RATE       = float(_cfg["rtsp"].get("frame_rate", 1))
 
 # ── YOLO ──────────────────────────────────────────────────────────
 YOLO_MODEL   = _cfg["yolo"].get("model", "yolo11x.pt")

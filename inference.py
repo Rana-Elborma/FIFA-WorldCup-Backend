@@ -9,10 +9,14 @@ Responsibilities:
   - Heatmap generation (OpenCV COLORMAP_JET → base64 JPEG)
   - Annotated frame generation (bounding boxes + count overlay)
   - density_from_count helper
+  - Live webcam demo  (run: python inference.py)
 
 Plug in YOLO here — tile_predict() is the only function that calls YOLO.
 """
 import base64
+import time
+import urllib.request
+import json as _json
 import numpy as np
 import cv2
 from ultralytics import YOLO
@@ -20,12 +24,25 @@ from ultralytics import YOLO
 from config import (
     YOLO_MODEL, CONF, TILE_GRID, TILE_OVERLAP, NMS_IOU,
     HEATMAP_GRID, HEATMAP_W, HEATMAP_H,
+    NORMAL_MAX, BUSY_MAX, MODEL_SERVER_URL,
 )
 
-# ── Load model once ───────────────────────────────────────────────
+# ── Load tiling model (used by API inference loop) ────────────────
 print("[inference] Loading YOLOv11x …")
 yolo_model = YOLO(YOLO_MODEL)
 print("[inference] YOLO ready.")
+
+# ── Live demo model (yolov8n — lightweight, no tiling, real-time) ─
+LIVE_YOLO_MODEL = "yolov8n.pt"
+_live_yolo: YOLO | None = None     # loaded lazily only when demo runs
+
+def _get_live_yolo() -> YOLO:
+    global _live_yolo
+    if _live_yolo is None:
+        print(f"[inference] Loading {LIVE_YOLO_MODEL} for live demo …")
+        _live_yolo = YOLO(LIVE_YOLO_MODEL)
+        print("[inference] Live YOLO ready.")
+    return _live_yolo
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -167,3 +184,138 @@ def annotate_frame(frame: np.ndarray, boxes: list[list[float]],
                 f"People: {count}  |  Risk: {risk or 'N/A'}  |  YOLOv11x 3x3 Tiling",
                 (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
     return out
+
+
+# ─────────────────────────────────────────────────────────────────
+# Live demo  —  fast single-frame detection (no tiling)
+# ─────────────────────────────────────────────────────────────────
+def detect_live(frame: np.ndarray) -> dict:
+    """
+    Run yolov8n on a single full frame (no tiling — fast enough for real-time).
+    Returns structured output ready for display and model server.
+
+    Output:
+        {
+            "people_count": int,
+            "density":      float,
+            "boxes":        [[x1,y1,x2,y2], ...],
+        }
+    """
+    model   = _get_live_yolo()
+    results = model.predict(source=frame, conf=CONF, verbose=False, classes=[0])
+    boxes_raw = results[0].boxes
+    boxes = []
+    if boxes_raw is not None and len(boxes_raw):
+        boxes = [b.xyxy[0].tolist() for b in boxes_raw]
+    count   = len(boxes)
+    density = density_from_count(count)
+    return {"people_count": count, "density": density, "boxes": boxes}
+
+
+
+def _risk_label(count: int) -> str:
+    if count > BUSY_MAX:   return "Critical"
+    if count > NORMAL_MAX: return "Busy"
+    return "Normal"
+
+
+def run_live_demo(webcam_index: int = 0) -> None:
+    """
+    Open webcam, run real-time YOLO detection, and display annotated feed.
+
+    Overlays:
+      - Green/orange/red bounding boxes (colour = risk level)
+      - HUD: People count  |  Density  |  Risk level
+      - FPS counter
+
+    Press  Q  or  ESC  to quit.
+    """
+    from camera import live_webcam_frames   # import here to avoid circular at module level
+
+    RISK_COLOR = {"Critical": (0, 0, 220), "Busy": (0, 165, 255), "Normal": (0, 200, 80)}
+
+    print("\n[demo] Starting live crowd detection — press Q or ESC to quit\n")
+    _get_live_yolo()   # warm up before first frame
+
+    fps_t   = time.perf_counter()
+    fps_val = 0.0
+    frames  = 0
+    api_state: dict = {}   # authoritative numbers from the API (same source as dashboard)
+
+    def _fetch_api_state():
+        """Pull latest metrics from the running API — same numbers the dashboard shows."""
+        try:
+            with urllib.request.urlopen(
+                f"{MODEL_SERVER_URL.replace('8001', '8000')}/api/v1/metrics/latest",
+                timeout=1
+            ) as r:
+                return _json.loads(r.read())
+        except Exception:
+            return {}
+
+    for frame in live_webcam_frames(webcam_index):
+        # Fast local detection — used only for bounding boxes (visual)
+        det   = detect_live(frame)
+        boxes = det["boxes"]
+
+        # Sync with API every 3 frames so HUD matches the dashboard exactly
+        if frames % 3 == 0:
+            fresh = _fetch_api_state()
+            if fresh:
+                api_state = fresh
+
+        # HUD numbers come from API state (same as dashboard) with local fallback
+        count    = api_state.get("peoplePred",      det["people_count"])
+        density  = api_state.get("avgDensity",      det["density"])
+        risk     = api_state.get("riskLevel",        _risk_label(det["people_count"]))
+        forecast = api_state.get("predDensity15",   round(min(9.0, density + 0.3), 1))
+
+        # ── Draw bounding boxes (colour = risk) ──────────────────
+        box_color = RISK_COLOR.get(risk, (0, 255, 80))
+        out = frame.copy()
+        for x1, y1, x2, y2 in boxes:
+            cv2.rectangle(out, (int(x1), int(y1)), (int(x2), int(y2)), box_color, 2)
+
+        # ── HUD overlay ─────────────────────────────────────────
+        h, w = out.shape[:2]
+        cv2.rectangle(out, (0, 0), (w, 56), (10, 16, 36), -1)
+
+        cv2.putText(out, f"People: {count}",
+                    (12, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(out, f"Density: {density:.1f}",
+                    (180, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (200, 220, 255), 2, cv2.LINE_AA)
+
+        risk_color_text = {
+            "Critical": (80, 80, 255), "Busy": (80, 180, 255), "Normal": (80, 230, 120)
+        }.get(risk, (255, 255, 255))
+        cv2.putText(out, f"Risk: {risk.upper()}",
+                    (360, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.65, risk_color_text, 2, cv2.LINE_AA)
+        cv2.putText(out, f"15-min forecast: {forecast:.1f}  |  FPS: {fps_val:.1f}  |  synced w/ dashboard",
+                    (12, 46), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (140, 180, 140), 1, cv2.LINE_AA)
+
+        # ── Risk badge (bottom-right) ────────────────────────────
+        badge_bg = {"Critical": (0, 0, 180), "Busy": (0, 120, 200), "Normal": (0, 150, 50)}
+        bx, by = w - 140, h - 40
+        cv2.rectangle(out, (bx, by), (w - 8, h - 8), badge_bg.get(risk, (60, 60, 60)), -1)
+        cv2.putText(out, risk.upper(), (bx + 8, h - 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+
+        # ── FPS ─────────────────────────────────────────────────
+        frames += 1
+        if frames % 10 == 0:
+            fps_val = 10.0 / (time.perf_counter() - fps_t)
+            fps_t   = time.perf_counter()
+
+        cv2.imshow("Live Crowd Detection  |  Q to quit", out)
+        if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q"), 27):
+            break
+
+    cv2.destroyAllWindows()
+    print("[demo] Stopped.")
+
+
+# ─────────────────────────────────────────────────────────────────
+# Entry point:  python inference.py
+# ─────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    run_live_demo(webcam_index=0)

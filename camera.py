@@ -17,6 +17,7 @@ import cv2
 from config import (
     SOURCE, VIDEO_FOLDER, VIDEO_FRAME_SKIP,
     WEBCAM_INDEX, RTSP_URL, RTSP_RECONNECT_DELAY,
+    RTSP_TRANSPORT, RTSP_FRAME_RATE,
 )
 
 
@@ -29,6 +30,8 @@ def frame_generator():
         yield from _webcam_gen()
     elif SOURCE == "rtsp":
         yield from _rtsp_gen()
+    elif SOURCE == "relay":
+        yield from _relay_gen()
     else:
         yield from _video_gen()
 
@@ -80,26 +83,81 @@ def _webcam_gen():
 
 
 # ─────────────────────────────────────────────────────────────────
-# RTSP stream mode  (NVR / DVR — plug in when camera is wired)
+# RTSP stream mode  (NVR / DVR — direct connection)
 # ─────────────────────────────────────────────────────────────────
 def _rtsp_gen():
-    # Hide credentials from logs
     display_url = RTSP_URL.split("@")[-1] if "@" in RTSP_URL else RTSP_URL
-    print(f"[camera] RTSP mode — {display_url}")
+    print(f"[camera] RTSP mode — {display_url} (transport={RTSP_TRANSPORT})")
+
+    frame_interval = 1.0 / max(RTSP_FRAME_RATE, 0.1)  # seconds between frames
+    consecutive_failures = 0
+
     while True:
-        cap = cv2.VideoCapture(RTSP_URL)
+        # Force TCP transport and reduce buffering for reliable NVR streams
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
+            f"rtsp_transport;{RTSP_TRANSPORT}|"
+            "buffer_size;1048576|"
+            "max_delay;500000"
+        )
+        cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # minimal buffer — get latest frame
+
         if not cap.isOpened():
-            print(f"[camera] RTSP not reachable — retrying in {RTSP_RECONNECT_DELAY}s")
-            time.sleep(RTSP_RECONNECT_DELAY)
+            consecutive_failures += 1
+            wait = min(RTSP_RECONNECT_DELAY * consecutive_failures, 30)
+            print(f"[camera] RTSP not reachable — retrying in {wait}s "
+                  f"(attempt {consecutive_failures})")
+            time.sleep(wait)
             continue
-        print(f"[camera] RTSP connected — {display_url}")
+
+        print(f"[camera] RTSP connected ✓ — {display_url}")
+        consecutive_failures = 0
+        last_frame_time = 0.0
+
         while True:
             ret, frame = cap.read()
             if not ret:
-                print("[camera] RTSP stream lost — reconnecting")
+                print("[camera] RTSP frame lost — reconnecting …")
                 break
-            yield frame, display_url
+
+            # Rate-limit: only yield at RTSP_FRAME_RATE fps
+            now = time.time()
+            if now - last_frame_time < frame_interval:
+                continue
+            last_frame_time = now
+            yield frame, f"CAM3:{display_url}"
+
         cap.release()
+        time.sleep(RTSP_RECONNECT_DELAY)
+
+
+# ─────────────────────────────────────────────────────────────────
+# Relay mode  (Pi edge agent POSTs frames to /api/v1/ingest/frame)
+# Mac backend receives JPEG bytes, decodes, runs inference.
+# Use when Mac cannot reach NVR directly.
+# ─────────────────────────────────────────────────────────────────
+_relay_queue: list = []
+_relay_lock = __import__("threading").Lock()
+
+
+def push_relay_frame(frame_bgr: np.ndarray) -> None:
+    """Called by /api/v1/ingest/frame to enqueue a frame from the Pi."""
+    with _relay_lock:
+        _relay_queue.clear()          # keep only the latest frame
+        _relay_queue.append(frame_bgr)
+
+
+def _relay_gen():
+    print("[camera] Relay mode — waiting for frames from Pi edge agent …")
+    while True:
+        frame = None
+        with _relay_lock:
+            if _relay_queue:
+                frame = _relay_queue[0]
+        if frame is not None:
+            yield frame, "PI-CAM3-relay"
+        else:
+            time.sleep(0.2)  # poll at 5 Hz
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -115,15 +173,48 @@ def _mock_gen():
 
 
 # ─────────────────────────────────────────────────────────────────
+# Live webcam  (direct access — used by inference.py demo mode)
+# Independent of config.yaml so it always opens the physical camera.
+# ─────────────────────────────────────────────────────────────────
+def live_webcam_frames(index: int = 0):
+    """
+    Yields raw frames from the webcam continuously.
+    Used by inference.py run_live_demo() — does not depend on config.yaml.
+    Raises RuntimeError if the camera cannot be opened.
+    """
+    cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        raise RuntimeError(f"[camera] Cannot open webcam at index {index}")
+    print(f"[camera] Webcam {index} opened — {int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))}×"
+          f"{int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))} @ "
+          f"{cap.get(cv2.CAP_PROP_FPS):.0f} fps")
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print("[camera] Frame read failed — retrying")
+                time.sleep(0.05)
+                continue
+            yield frame
+    finally:
+        cap.release()
+        print("[camera] Webcam released")
+
+
+# ─────────────────────────────────────────────────────────────────
 # Status helper  (exposed via /api/v1/camera/status)
 # ─────────────────────────────────────────────────────────────────
 def camera_status() -> dict:
     display_url = RTSP_URL.split("@")[-1] if "@" in RTSP_URL else RTSP_URL
+    with _relay_lock:
+        relay_active = len(_relay_queue) > 0
     return {
         "source":        SOURCE,
-        "video_folder":  VIDEO_FOLDER  if SOURCE == "video"  else None,
-        "frame_skip":    VIDEO_FRAME_SKIP if SOURCE == "video" else None,
-        "webcam_index":  WEBCAM_INDEX  if SOURCE == "webcam" else None,
-        "rtsp_url":      display_url   if SOURCE == "rtsp"   else None,
-        "connected":     SOURCE in ("webcam", "rtsp"),
+        "video_folder":  VIDEO_FOLDER     if SOURCE == "video"  else None,
+        "frame_skip":    VIDEO_FRAME_SKIP if SOURCE == "video"  else None,
+        "webcam_index":  WEBCAM_INDEX     if SOURCE == "webcam" else None,
+        "rtsp_url":      display_url      if SOURCE == "rtsp"   else None,
+        "relay_active":  relay_active     if SOURCE == "relay"  else None,
+        "connected":     SOURCE in ("webcam", "rtsp") or
+                         (SOURCE == "relay" and relay_active),
     }
