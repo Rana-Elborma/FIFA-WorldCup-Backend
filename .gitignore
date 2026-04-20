@@ -3,3 +3,6 @@ __pycache__/
 .venv/
 .env
 yolo11x.pt
+yolo11n.pt
+yolov8n.pt
+config.yaml
