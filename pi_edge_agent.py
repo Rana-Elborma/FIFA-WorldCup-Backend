@@ -28,9 +28,10 @@ RTSP_URL       = os.environ.get("RTSP_URL",
 BACKEND_URL    = os.environ.get("BACKEND_URL",
     "http://192.168.2.2:8000")          # change to your Mac's IP on the same network
 CAMERA_ID      = os.environ.get("CAMERA_ID", "cam3")
-FRAME_INTERVAL = float(os.environ.get("FRAME_INTERVAL", "1"))  # seconds
+FRAME_INTERVAL = float(os.environ.get("FRAME_INTERVAL", "0.1"))  # 10 fps
 RECONNECT_WAIT = int(os.environ.get("RECONNECT_WAIT", "5"))
-JPEG_QUALITY   = int(os.environ.get("JPEG_QUALITY", "75"))     # 75 = good quality, ~40KB
+JPEG_QUALITY   = int(os.environ.get("JPEG_QUALITY", "50"))      # smaller payload = faster transfer
+SEND_WIDTH     = int(os.environ.get("SEND_WIDTH", "640"))        # resize before sending
 
 INGEST_ENDPOINT = f"{BACKEND_URL}/api/v1/ingest/frame"
 HEALTH_ENDPOINT = f"{BACKEND_URL}/api/v1/health"
@@ -62,6 +63,10 @@ def wait_for_backend(timeout: int = 60):
 
 # ── Frame sender ─────────────────────────────────────────────────
 def send_frame(frame_bgr) -> bool:
+    h, w = frame_bgr.shape[:2]
+    if w > SEND_WIDTH:
+        frame_bgr = cv2.resize(frame_bgr, (SEND_WIDTH, int(h * SEND_WIDTH / w)),
+                               interpolation=cv2.INTER_LINEAR)
     _, buf = cv2.imencode(".jpg", frame_bgr,
                           [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
     b64 = base64.b64encode(buf).decode("utf-8")
@@ -88,7 +93,7 @@ def capture_loop():
 
     while True:
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = (
-            "rtsp_transport;tcp|buffer_size;1048576|max_delay;500000"
+            "rtsp_transport;tcp|buffer_size;1048576|max_delay;500000|loglevel;quiet"
         )
         log.info(f"Connecting to RTSP: {display}")
         cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)

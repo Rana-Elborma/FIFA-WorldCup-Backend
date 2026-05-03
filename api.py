@@ -22,6 +22,7 @@ Run:
   .venv/bin/python -m uvicorn api:app --port 8000 --reload
 """
 
+import asyncio
 import base64
 import time
 import threading
@@ -31,6 +32,7 @@ import json as _json
 import cv2
 import numpy as np
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 import config
@@ -71,49 +73,68 @@ def _call_model_server(count, density, time_of_day,
 
 
 # ─────────────────────────────────────────────────────────────────
-# BACKGROUND INFERENCE LOOP  (runs in daemon thread)
+# SHARED STATE between frame thread and YOLO thread
 # ─────────────────────────────────────────────────────────────────
-def _inference_loop():
-    frame_gen   = camera.frame_generator()
-    time_of_day = 10.0           # fixed for now; replace with real clock if needed
+_yolo_input:  dict = {"frame": None, "source": ""}   # latest frame for YOLO to pick up
+_yolo_output: dict = {                                # latest YOLO results
+    "boxes": [], "count": 0, "density": 0.0,
+    "risk": "Normal", "forecast": 0.0,
+}
+_yolo_lock  = threading.Lock()
+_input_lock = threading.Lock()
+
+
+# ─────────────────────────────────────────────────────────────────
+# YOLO THREAD  — runs inference as fast as it can, independent of frame rate
+# ─────────────────────────────────────────────────────────────────
+def _yolo_loop():
+    time_of_day  = 10.0
+    last_seen_id = None
 
     while True:
-        # 1. Get next frame from camera source
-        frame, source_name = next(frame_gen)
-        frame_h, frame_w   = frame.shape[:2]
+        # Pick up latest frame if it's new
+        with _input_lock:
+            frame      = _yolo_input["frame"]
+            source_name = _yolo_input["source"]
+            frame_id   = id(frame) if frame is not None else None
 
-        # 2. YOLO detection (plug-in point: inference.tile_predict)
-        boxes   = inference.tile_predict(frame)
-        feats   = inference.extract_features(boxes, frame_w, frame_h)
+        if frame is None or frame_id == last_seen_id:
+            time.sleep(0.005)   # wait for a new frame
+            continue
+
+        last_seen_id = frame_id
+        frame_h, frame_w = frame.shape[:2]
+
+        small = cv2.resize(frame, (960, int(960 * frame_h / frame_w)))
+        boxes = inference.tile_predict(small)
+        sx, sy = frame_w / 960, frame_h / int(960 * frame_h / frame_w)
+        boxes  = [[x1*sx, y1*sy, x2*sx, y2*sy] for x1, y1, x2, y2 in boxes]
+        feats  = inference.extract_features(boxes, frame_w, frame_h)
         count   = feats["count"]
         density = inference.density_from_count(count)
 
-        # 3. LightGBM forecast + TensorFlow classification (via model_server)
-        ms      = _call_model_server(count, density, time_of_day,
-                                     feats["cx_std"], feats["cy_std"],
-                                     feats["avg_box_area"])
+        ms = _call_model_server(count, density, time_of_day,
+                                feats["cx_std"], feats["cy_std"], feats["avg_box_area"])
         forecast = ms.get("predictedDensity", round(min(9.0, density + 0.6), 1))
         risk     = ms.get("predictedRisk",
                           "Critical" if count > config.BUSY_MAX
                           else "Busy" if count > config.NORMAL_MAX
                           else "Normal")
 
-        # 4. Alert system + save to Supabase
+        with _yolo_lock:
+            _yolo_output["boxes"]   = boxes
+            _yolo_output["count"]   = count
+            _yolo_output["density"] = density
+            _yolo_output["risk"]    = risk
+            _yolo_output["forecast"] = forecast
+
+        # Alerts + Supabase + state updates
         new_alerts = alerts.check_and_dispatch(risk, count, density, source_name)
         for a in new_alerts:
             supabase_writer.push_alert(a["level"], a["message"])
 
-        # 5. Heatmap (base64 JPEG)
-        state.set_heatmap(
-            inference.build_heatmap(feats["centres"], frame_w, frame_h)
-        )
+        state.set_heatmap(inference.build_heatmap(feats["centres"], frame_w, frame_h))
 
-        # 6. Annotated frame for /stream/frame endpoint
-        annotated = inference.annotate_frame(frame, boxes, count, risk)
-        _, buf    = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 72])
-        state.set_annotated_frame(base64.b64encode(buf).decode("utf-8"))
-
-        # 7. Update shared state
         ts = time.strftime("%H:%M:%S")
         state.update({
             "timestamp":       ts,
@@ -134,27 +155,44 @@ def _inference_loop():
             "trackedIDs":    count,
         })
 
-        # 8. Push to Supabase (non-blocking — batched every 5 s)
         arrivals = count / max(config.UPDATE_EVERY_SEC, 1)
-        supabase_writer.push_metric_window(
-            density_ppm2     = density,
-            arrivals_per_min = arrivals,
-        )
-        supabase_writer.push_prediction(
-            density_pred = forecast,
-            severity     = risk,
-            horizon_min  = 15,
-        )
+        supabase_writer.push_metric_window(density_ppm2=density, arrivals_per_min=arrivals)
+        supabase_writer.push_prediction(density_pred=forecast, severity=risk, horizon_min=15)
         supabase_writer.push_system_log(
-            level    = "INFO",
-            source   = source_name,
-            message  = f"Inference cycle: {count} people, density={density:.2f}, risk={risk}",
-            metadata = {"count": count, "density": density, "risk": risk, "forecast": forecast},
+            level="INFO", source=source_name,
+            message=f"Inference cycle: {count} people, density={density:.2f}, risk={risk}",
+            metadata={"count": count, "density": density, "risk": risk},
         )
 
-        time.sleep(config.UPDATE_EVERY_SEC)
+
+# ─────────────────────────────────────────────────────────────────
+# FRAME THREAD  — feeds camera frames + pushes annotated stream
+# ─────────────────────────────────────────────────────────────────
+def _inference_loop():
+    frame_gen = camera.frame_generator()
+
+    while True:
+        frame, source_name = next(frame_gen)
+
+        # Hand latest frame to YOLO thread (non-blocking)
+        with _input_lock:
+            _yolo_input["frame"]  = frame
+            _yolo_input["source"] = source_name
+
+        # Read latest YOLO results (non-blocking)
+        with _yolo_lock:
+            boxes = _yolo_output["boxes"]
+            count = _yolo_output["count"]
+            risk  = _yolo_output["risk"]
+
+        # Always push annotated frame — smooth video regardless of YOLO speed
+        annotated = inference.annotate_frame(frame, boxes, count, risk)
+        display   = cv2.resize(annotated, (960, 540), interpolation=cv2.INTER_LINEAR)
+        _, buf    = cv2.imencode(".jpg", display, [cv2.IMWRITE_JPEG_QUALITY, 65])
+        state.set_annotated_frame(base64.b64encode(buf).decode("utf-8"))
 
 
+threading.Thread(target=_yolo_loop,      daemon=True).start()
 threading.Thread(target=_inference_loop, daemon=True).start()
 
 
@@ -240,6 +278,27 @@ def camera_status():
 def stream_frame():
     """Latest annotated frame as base64 JPEG — bounding boxes + HUD overlay."""
     return {"frame": state.last_annotated_frame}
+
+
+@app.get("/api/v1/stream/mjpeg", tags=["Stream"])
+async def mjpeg_stream():
+    """Continuous MJPEG stream — set as <img src> for smooth real-time video."""
+    async def generate():
+        while True:
+            frame_b64 = state.last_annotated_frame
+            if frame_b64:
+                frame_bytes = base64.b64decode(frame_b64)
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n" +
+                    frame_bytes + b"\r\n"
+                )
+            await asyncio.sleep(0.02)   # up to 50 fps
+    return StreamingResponse(
+        generate(),
+        media_type="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-cache", "Access-Control-Allow-Origin": "*"},
+    )
 
 
 # ── Live camera endpoint ───────────────────────────────────────────

@@ -149,15 +149,19 @@ def push_relay_frame(frame_bgr: np.ndarray) -> None:
 
 def _relay_gen():
     print("[camera] Relay mode — waiting for frames from Pi edge agent …")
+    last_id = None
     while True:
         frame = None
         with _relay_lock:
             if _relay_queue:
-                frame = _relay_queue[0]
+                candidate = _relay_queue[0]
+                if id(candidate) != last_id:
+                    frame = candidate
+                    last_id = id(candidate)
         if frame is not None:
             yield frame, "PI-CAM3-relay"
         else:
-            time.sleep(0.2)  # poll at 5 Hz
+            time.sleep(0.02)  # poll at 50 Hz — pick up new frame fast
 
 
 # ─────────────────────────────────────────────────────────────────

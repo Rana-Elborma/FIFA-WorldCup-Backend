@@ -71,45 +71,88 @@ def _nms(boxes: np.ndarray, scores: np.ndarray, iou_thr: float) -> list[int]:
 # ─────────────────────────────────────────────────────────────────
 # YOLO  —  plug-in point
 # ─────────────────────────────────────────────────────────────────
-def tile_predict(frame: np.ndarray) -> list[list[float]]:
-    """
-    Split frame into TILE_GRID×TILE_GRID overlapping tiles.
-    Run YOLOv11x on each tile, map boxes back to frame coordinates,
-    deduplicate with NMS.
-
-    Returns: list of [x1, y1, x2, y2] in original frame pixel coords.
-
-    To swap YOLO version: replace `yolo_model.predict(...)` below.
-    """
+def _run_yolo_on_tiles(frame: np.ndarray, grid: int) -> tuple[list, list]:
+    """Run YOLO on a frame split into grid×grid tiles. Returns (boxes, scores)."""
     h, w   = frame.shape[:2]
-    th, tw = h // TILE_GRID, w // TILE_GRID
+    th, tw = h // grid, w // grid
     ph, pw = int(th * TILE_OVERLAP), int(tw * TILE_OVERLAP)
-
     all_boxes, all_scores = [], []
-
-    for row in range(TILE_GRID):
-        for col in range(TILE_GRID):
+    for row in range(grid):
+        for col in range(grid):
             y1 = max(0, row * th - ph);  y2 = min(h, (row + 1) * th + ph)
             x1 = max(0, col * tw - pw);  x2 = min(w, (col + 1) * tw + pw)
-            tile    = frame[y1:y2, x1:x2]
-
-            # ── YOLO inference (swap model here if needed) ──
+            tile = frame[y1:y2, x1:x2]
             results = yolo_model.predict(
-                source=tile, conf=CONF, verbose=False, classes=[0]   # classes=[0] = person only
+                source=tile, conf=CONF, verbose=False, classes=[0],
+                imgsz=640, iou=0.4, agnostic_nms=True,
             )
             boxes = results[0].boxes
             if boxes is None or len(boxes) == 0:
                 continue
             for box in boxes:
                 bx1, by1, bx2, by2 = box.xyxy[0].tolist()
-                # remap to original frame coordinates
                 all_boxes.append([bx1 + x1, by1 + y1, bx2 + x1, by2 + y1])
                 all_scores.append(float(box.conf[0]))
+    return all_boxes, all_scores
 
+
+# close-up threshold: if any detected box covers >8% of the frame area → person is near
+_CLOSE_UP_RATIO = 0.08
+
+
+def _filter_person_boxes(boxes: list, frame_w: int, frame_h: int) -> list:
+    """
+    Remove boxes that clearly aren't people:
+      - Must have minimum height (>= 5% of frame height) — removes tiny noise
+      - Width must not be more than 2.5x the height — removes very wide horizontal objects
+      - Must not be entirely in the top 10% of frame — removes ceiling/clock artifacts
+    """
+    out = []
+    min_h = frame_h * 0.05
+    for x1, y1, x2, y2 in boxes:
+        bw = x2 - x1
+        bh = y2 - y1
+        if bh < min_h:
+            continue                        # too small — noise
+        if bw > 0 and bh / bw < 0.4:
+            continue                        # extremely wide — definitely not a person
+        if y2 < frame_h * 0.10:
+            continue                        # entirely in top 10% — ceiling artifact
+        out.append([x1, y1, x2, y2])
+    return out
+
+
+def tile_predict(frame: np.ndarray) -> list[list[float]]:
+    """
+    Adaptive tiling:
+      1. Run a fast single-pass (no tiling) first.
+      2. If detected boxes are large (person is close) → return result as-is.
+      3. If boxes are small or none (person is far) → re-run with 2×2 tiling
+         so small/distant people are detected accurately.
+    """
+    h, w       = frame.shape[:2]
+    frame_area = h * w
+
+    # Step 1 — single pass (fast)
+    boxes_1, scores_1 = _run_yolo_on_tiles(frame, grid=1)
+
+    # Step 2 — check if any box is large (close-up person)
+    if boxes_1:
+        avg_area = np.mean(
+            [(x2 - x1) * (y2 - y1) for x1, y1, x2, y2 in boxes_1]
+        ) / frame_area
+        if avg_area >= _CLOSE_UP_RATIO:
+            keep = _nms(np.array(boxes_1), np.array(scores_1), NMS_IOU)
+            return _filter_person_boxes([boxes_1[i] for i in keep], w, h)
+
+    # Step 3 — person is far or not detected in single pass → use 2×2 tiling
+    boxes_2, scores_2 = _run_yolo_on_tiles(frame, grid=2)
+    all_boxes  = boxes_1  + boxes_2
+    all_scores = scores_1 + scores_2
     if not all_boxes:
         return []
     keep = _nms(np.array(all_boxes), np.array(all_scores), NMS_IOU)
-    return [all_boxes[i] for i in keep]
+    return _filter_person_boxes([all_boxes[i] for i in keep], w, h)
 
 
 # ─────────────────────────────────────────────────────────────────
@@ -176,13 +219,9 @@ def annotate_frame(frame: np.ndarray, boxes: list[list[float]],
     out = frame.copy()
     for x1, y1, x2, y2 in boxes:
         cv2.rectangle(out, (int(x1), int(y1)), (int(x2), int(y2)), box_color, 2)
-
-    # HUD banner
-    h, w = out.shape[:2]
-    cv2.rectangle(out, (0, 0), (w, 44), (10, 18, 40), -1)
-    cv2.putText(out,
-                f"People: {count}  |  Risk: {risk or 'N/A'}  |  YOLOv11x 3x3 Tiling",
-                (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+        # small label above each box
+        cv2.putText(out, "person", (int(x1), max(int(y1) - 6, 12)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, box_color, 1, cv2.LINE_AA)
     return out
 
 
